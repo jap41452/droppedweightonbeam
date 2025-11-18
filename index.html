@@ -417,7 +417,25 @@ async function editNode(i) {
 }
 
 // ===== Drop-weight transient (RK4 with MODAL structural damping) =====
-let anim = { frames: [], times: [], xs: [], maxAbs: 0, running:false, rafId:0, idx:0, speed:0.5, mode:'stick', dropRef:0, g:386, massY:[], dropXpx:0 };
+// Expanded anim object: includes pre-drop phase (60 frames) + main response
+let anim = {
+  frames: [],       // beam response frames
+  times: [],        // beam response times
+  xs: [],
+  maxAbs: 0,
+  running: false,
+  rafId: 0,
+  idx: 0,
+  speed: 0.5,
+  mode: 'stick',
+  dropRef: 0,
+  g: 386,
+  massY: [],
+  dropXpx: 0,
+  preN: 60,         // number of pre-drop frames
+  preYs: [],        // normalized 1→top, 0→impact
+  tFall: 0          // physical free-fall time
+};
 
 function computeRefinedXs(){
   const m = getRefine();
@@ -479,6 +497,28 @@ function simulateDrop(){
   const H = Math.max(0, Number(nodes[dropNode].H)||0);
   const vImpact = Math.sqrt(2*g*H);
   const m_drop = W / g;
+
+  // ----- Pre-drop (Phase A) visual setup: 60 frames of free fall -----
+  (function setupPreDrop(){
+    const Npre = anim.preN || 60;
+    const tFall = (H > 0 && g > 0) ? Math.sqrt(2 * H / g) : 0;
+    anim.tFall = tFall;
+    anim.preYs = [];
+
+    for (let k = 0; k < Npre; k++) {
+      const tau = (Npre === 1) ? 0 : (k / (Npre - 1)); // 0 → 1
+      const t_pre = tau * tFall;
+
+      // physical height: y = H - 0.5 g t^2 (clamp at 0)
+      let y_phys = H - 0.5 * g * t_pre * t_pre;
+      if (y_phys < 0) y_phys = 0;
+
+      // normalize: 1 at release (top), 0 at impact
+      const yNorm = (H > 0) ? (y_phys / H) : 0;
+      anim.preYs.push(yNorm);
+    }
+  })();
+  // ----- end pre-drop setup -----
 
   const m = getRefine();
   const S = segments.length; 
@@ -673,9 +713,19 @@ function simulateDrop(){
   const margin = MARGIN_X; 
   const totalL = segments.reduce((s,seg)=> s+seg.L, 0) || 1; 
   const scaleX = (document.getElementById('animCanvas').width - 2*margin)/totalL;
-  anim.frames = frames; anim.times = times; anim.xs = xsRef; anim.maxAbs = maxAbs || 1; anim.idx = 0; anim.mode = mode; anim.dropRef = dropRef; anim.g = g;
-  anim.massY = (mode==='bounce') ? massY.filter((_,i)=> (i % Math.max(1, Math.floor(steps/frames.length))) === 0) : new Array(frames.length).fill(0);
+  anim.frames = frames;
+  anim.times = times;
+  anim.xs = xsRef;
+  anim.maxAbs = maxAbs || 1;
+  anim.idx = 0;
+  anim.mode = mode;
+  anim.dropRef = dropRef;
+  anim.g = g;
+  anim.massY = (mode==='bounce')
+    ? massY.filter((_,i)=> (i % Math.max(1, Math.floor(steps/frames.length))) === 0)
+    : new Array(frames.length).fill(0);
   anim.dropXpx = margin + (xsRef[dropRef]||0) * scaleX;
+
   startAnimation();
 
   lastSim = { ts, wDrop: ys_drop, nodeNames, nodeW };
@@ -758,13 +808,20 @@ function computeFirstMode(){
 function startAnimation(){
   const btn = document.getElementById('btnAnimToggle');
   const status = document.getElementById('animStatus');
-  if (!anim.frames.length){ status.textContent='(no frames)'; return; }
-  if (anim.running) return; anim.running = true; btn.textContent='Pause'; status.textContent='';
+
+  const totalFrames = (anim.preYs?.length || 0) + anim.frames.length;
+  if (!totalFrames){ status.textContent='(no frames)'; return; }
+
+  if (anim.running) return;
+  anim.running = true;
+  btn.textContent = 'Pause';
+  status.textContent = '';
+
   const step = () => {
     if (!anim.running) return;
     drawAnimFrame(Math.floor(anim.idx));
     anim.idx += Math.max(0.01, anim.speed);
-    if (anim.idx >= anim.frames.length) anim.idx = 0;
+    if (anim.idx >= totalFrames) anim.idx = 0;
     anim.rafId = requestAnimationFrame(step);
   };
   anim.rafId = requestAnimationFrame(step);
@@ -779,15 +836,68 @@ function drawAnimFrame(i){
   const canvas = document.getElementById('animCanvas');
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0,0,canvas.width, canvas.height);
-  const margin = MARGIN_X; const midY = canvas.height/2;
+
+  const margin = MARGIN_X;
+  const midY = canvas.height/2;
   const totalL = segments.reduce((s,seg)=> s+seg.L, 0) || 1;
   const scaleX = (canvas.width - 2*margin)/totalL;
+
+  const Npre = anim.preYs ? anim.preYs.length : 0;
+
+  // If no dropXpx yet (for safety), default to ~10% of beam length
+  const defaultX = margin + 0.1 * totalL * scaleX;
+  const Xc = anim.dropXpx || defaultX;
+
+  // ===== PHASE A: Pre-drop free fall (no beam motion) =====
+  if (i < Npre && Npre > 0) {
+    // Draw straight beam line
+    ctx.strokeStyle = '#aaa';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(margin, midY);
+    ctx.lineTo(margin + totalL * scaleX, midY);
+    ctx.stroke();
+
+    // Map normalized height (1→top, 0→impact) to pixels
+    const yNorm = anim.preYs[i];   // 1 at release, 0 at impact
+    const Yimpact = midY;
+
+    // Put top position above beam (e.g. 35% of canvas height)
+    const topOffset = canvas.height * 0.35;
+    const Ytop = midY - topOffset;
+
+    const Ymass = Yimpact + (Ytop - Yimpact) * yNorm;
+
+    // Draw the dropping mass
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(Xc, Ymass, 16, 0, Math.PI * 2);
+    ctx.fill();
+
+    // No time label during pre-drop
+    return;
+  }
+
+  // ===== PHASE B: Existing beam response animation =====
+  const j = Math.max(0, i - Npre);
+  const frameIdx = Math.min(j, anim.frames.length - 1);
+  const xs = anim.xs;
+  const w = anim.frames[frameIdx];
+
+  if (!w || !xs || !xs.length) return;
+
   const scaleY = (canvas.height*0.40) / anim.maxAbs;
-  const xs = anim.xs; const w = anim.frames[i];
 
-  ctx.strokeStyle = '#aaa'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(margin, midY); ctx.lineTo(margin + totalL*scaleX, midY); ctx.stroke();
+  // Undeformed reference line
+  ctx.strokeStyle = '#aaa'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(margin, midY);
+  ctx.lineTo(margin + totalL*scaleX, midY);
+  ctx.stroke();
 
-  ctx.strokeStyle = '#1f77b4'; ctx.lineWidth = 2; ctx.beginPath();
+  // Deflected beam
+  ctx.strokeStyle = '#1f77b4'; ctx.lineWidth = 2;
+  ctx.beginPath();
   for (let k=0;k<xs.length;k++){
     const X = margin + xs[k]*scaleX;
     const Y = midY - w[k]*scaleY;
@@ -795,15 +905,22 @@ function drawAnimFrame(i){
   }
   ctx.stroke();
 
-  const Xc = anim.dropXpx; const wNode = w[anim.dropRef] || 0;
+  // Mass (stick or bounce)
+  const wNode = w[anim.dropRef] || 0;
   let Ymass = midY - wNode*scaleY;
   if (anim.mode === 'bounce'){
-    const idx = Math.min(i, anim.massY.length-1);
+    const idx = Math.min(frameIdx, anim.massY.length-1);
     Ymass = midY - (wNode + anim.massY[idx]) * scaleY;
   }
-  ctx.fillStyle = '#000'; ctx.beginPath(); ctx.arc(Xc, Ymass, 16, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(Xc, Ymass, 16, 0, Math.PI*2);
+  ctx.fill();
 
-  const t = (anim.times && anim.times.length) ? (anim.times[Math.max(0, Math.min(i, anim.times.length-1))]) : 0;
+  // Time label: time since impact (beam response)
+  const t = (anim.times && anim.times.length)
+    ? anim.times[Math.max(0, Math.min(frameIdx, anim.times.length-1))]
+    : 0;
   const label = `t = ${Number(t).toFixed(3)} s`;
   ctx.font = '12px sans-serif';
   const pad = 6; const boxH = 18; const wText = ctx.measureText(label).width;
@@ -910,3 +1027,4 @@ window.testCantileverBounce = testCantileverBounce;
 </script>
 </body>
 </html>
+
